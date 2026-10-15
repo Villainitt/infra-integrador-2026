@@ -1,4 +1,4 @@
-openapi: 3.0.3
+openapi: 3.1.0
 info:
   title: Landing Pages e Formulários — API
   version: 0.1.0
@@ -8,8 +8,7 @@ info:
 
     **Escopo deste arquivo:** frentes de Camila Martins Sousa (formulários e fundação),
     Giovanna Castro Freitas (landing pages), Emmylio Chaves Queiroz (área pública e embed)
-    e Pablo Leandro Gloria (chatbot, origem e métricas). As rotas de envios (telas 7 e 8,
-    frente do Rafael) ficam fora e entram no mesmo arquivo pelo PR dele.
+    Pablo Leandro Gloria (chatbot, origem e métricas) e Rafael (envios, telas 7 e 8).
 
     **Regras do Contrato aplicadas em todas as rotas**
     - Envelope `success` / `data` / `message` / `errors` em todas as respostas, inclusive
@@ -22,8 +21,41 @@ info:
     - Rotas públicas ficam sob `/public/landing/**`, sem token, com rate limit por IP, e
       nunca devolvem dado de negócio (§12.6).
 
+    **Dado pessoal e consentimento (LGPD)**
+    - O envio guarda o dado de terceiro que o visitante digitou (nome, e-mail, telefone e as
+      demais respostas), a origem (UTMs, referenciador, página de entrada), o canal e o
+      registro do consentimento: o texto exibido no momento do aceite e a data/hora do aceite.
+    - Sem `consentimento.aceito = true` nada é gravado (`400 CONSENTIMENTO_OBRIGATORIO`). O
+      consentimento cobre o uso dos dados para o contato comercial do tenant dono do
+      formulário, nos termos do texto exibido; nada é repassado a outro tenant.
+    - Retenção: o envio fica guardado por até 24 meses a partir do recebimento. Depois disso,
+      ou antes, a pedido do titular, as respostas são anonimizadas (o valor de cada campo vira
+      `null`); origem, canal e data ficam, para as métricas. A anonimização no Landing não
+      alcança a cópia já criada no CRM, que segue a regra do próprio CRM.
+    - O RF56 do identity trata dos usuários da plataforma, não dos visitantes; por isso o
+      Landing não consome `identity.usuario.anonimizado`.
+
+    **Como o CRM recebe o lead**
+    - O Landing chama a API do CRM depois de gravar o envio, para criar ou reaproveitar empresa
+      e contato, com as regras do §9: token de serviço do `landing`, cabeçalho `X-Tenant-Id`
+      com o tenant do formulário e timeout de 3 s. Se o CRM não responder, o envio continua
+      gravado, sem `empresaId`/`contatoId`.
+    - Em seguida o Landing publica `landing.formulario.recebido` (ver
+      `landing.asyncapi.yaml`), consumido pelo Marketing.
+    - O Landing é o dono de formulários, campos e envios; o Marketing não guarda cópia do
+      formulário, só consome. Para exibir as respostas e a definição do formulário, o Marketing
+      chama o Landing por **token de serviço** (`clientId` `marketing`), direto em
+      `http://landing:8088`, nunca pelo gateway, com `X-Tenant-Id` (§9.2). Só duas rotas aceitam
+      token de serviço: `GET /api/landing/envios/{id}` (`landing.envio.ver`) e
+      `GET /api/landing/formularios/{id}/resumo` (`landing.formulario.ver_resumo`). O
+      identificador do envio chega ao Marketing no evento `landing.formulario.recebido`.
+    - As demais rotas de envios existem para a tela `/envios` do próprio módulo.
+
     **Extensões usadas:** `x-responsavel` indica a frente dona da rota; `x-situacao` diz se
     a rota já foi entregue (`implementado`) ou ainda está prevista (`previsto`).
+  license:
+    name: Uso acadêmico — Projeto Integrador 2026
+    identifier: LicenseRef-Academico
   contact:
     name: Grupo 7 — Landing Pages e Formulários
 servers:
@@ -40,6 +72,8 @@ tags:
     description: Saúde do serviço (§8.5). Frente de Camila Martins Sousa (fundação).
   - name: Formulários
     description: Telas 4 e 5. Frente de Camila Martins Sousa.
+  - name: Envios
+    description: Telas 7 e 8. Frente de Rafael.
   - name: Landing Pages
     description: Telas 1, 2 e 3. Frente de Giovanna Castro Freitas.
   - name: Embed
@@ -208,6 +242,36 @@ paths:
       x-permissao: landing.formulario.excluir
       responses:
         '200': { $ref: '#/components/responses/SucessoSemDados' }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+        '403': { $ref: '#/components/responses/SemPermissao' }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+
+  /api/landing/formularios/{id}/resumo:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Formulários]
+      summary: Resumo do formulário, com os campos (consumo por outros módulos)
+      description: |
+        Definição do formulário (nome, status, campos e tipos) para o Marketing interpretar as
+        respostas de um envio. Aceita token de serviço do `marketing` (§9.2, §9.3) e também
+        token de usuário com a permissão fraca de resumo. Não devolve chave de embed nem
+        mapeamento para o CRM.
+      operationId: resumoFormulario
+      x-responsavel: Camila Martins Sousa
+      x-situacao: previsto
+      x-permissao: landing.formulario.ver_resumo
+      responses:
+        '200':
+          description: Formulário
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Formulario' }
         '401': { $ref: '#/components/responses/NaoAutenticado' }
         '403': { $ref: '#/components/responses/SemPermissao' }
         '404': { $ref: '#/components/responses/NaoEncontrado' }
@@ -949,6 +1013,95 @@ paths:
         '404': { $ref: '#/components/responses/NaoEncontrado' }
 
   # ════════════════════════════════════════════════════════════════════
+  #  ENVIOS — Rafael (telas 7 e 8)
+  # ════════════════════════════════════════════════════════════════════
+
+  /api/landing/envios:
+    get:
+      tags: [Envios]
+      summary: Listar envios recebidos (tela 7)
+      description: |
+        Lista os envios do tenant, do mais recente para o mais antigo por padrão. A listagem
+        mostra só o resumo (nome e e-mail do visitante, formulário, canal, data); as respostas
+        completas ficam no detalhe.
+      operationId: listarEnvios
+      x-responsavel: Rafael
+      x-situacao: previsto
+      x-permissao: landing.envio.ver
+      parameters:
+        - $ref: '#/components/parameters/Pagina'
+        - $ref: '#/components/parameters/Tamanho'
+        - $ref: '#/components/parameters/Ordenar'
+        - $ref: '#/components/parameters/FiltroFormularioId'
+        - $ref: '#/components/parameters/FiltroPaginaId'
+        - name: canal
+          in: query
+          schema: { $ref: '#/components/schemas/CanalEnvio' }
+        - name: de
+          in: query
+          description: Envios recebidos a partir desta data (inclusive).
+          schema: { type: string, format: date, example: '2026-09-01' }
+        - name: ate
+          in: query
+          description: Envios recebidos até esta data (inclusive).
+          schema: { type: string, format: date, example: '2026-09-30' }
+        - name: busca
+          in: query
+          description: Filtra por nome ou e-mail do visitante (contém, sem diferenciar maiúsculas).
+          schema: { type: string }
+      responses:
+        '200':
+          description: Página de envios
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginaResultado'
+                          - type: object
+                            properties:
+                              itens:
+                                type: array
+                                items: { $ref: '#/components/schemas/EnvioResumo' }
+        '400': { $ref: '#/components/responses/ErroValidacao' }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+        '403': { $ref: '#/components/responses/SemPermissao' }
+
+  /api/landing/envios/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Envios]
+      summary: Detalhe do envio (tela 8)
+      description: |
+        Respostas campo a campo, origem do visitante e registro do consentimento. Envio
+        anonimizado (ver "Dado pessoal e consentimento" no início) volta com
+        `anonimizado = true` e o `valor` das respostas `null`. Aceita também token de serviço do
+        `marketing` (§9.2), para exibir as respostas na fila de leads.
+      operationId: obterEnvio
+      x-responsavel: Rafael
+      x-situacao: previsto
+      x-permissao: landing.envio.ver
+      responses:
+        '200':
+          description: Envio
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Envio' }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+        '403': { $ref: '#/components/responses/SemPermissao' }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+
+  # ════════════════════════════════════════════════════════════════════
   #  MÉTRICAS — Pablo (tela 11)
   # ════════════════════════════════════════════════════════════════════
 
@@ -1063,8 +1216,7 @@ paths:
                                     - type: object
                                       properties:
                                         campanha:
-                                          type: string
-                                          nullable: true
+                                          type: [string, 'null']
                                           description: Valor de utm_campaign; nulo agrupa o tráfego sem campanha.
                                     - $ref: '#/components/schemas/Metricas'
         '400': { $ref: '#/components/responses/ErroValidacao' }
@@ -1299,8 +1451,7 @@ paths:
               type: object
               properties:
                 paginaSlug:
-                  type: string
-                  nullable: true
+                  type: [string, 'null']
                   description: Slug da landing page, quando o formulário está dentro de uma.
                 origem: { $ref: '#/components/schemas/Origem' }
       responses:
@@ -1334,8 +1485,7 @@ paths:
               type: object
               properties:
                 paginaSlug:
-                  type: string
-                  nullable: true
+                  type: [string, 'null']
                 origem: { $ref: '#/components/schemas/Origem' }
       responses:
         '201':
@@ -1723,11 +1873,9 @@ components:
       properties:
         success: { type: boolean }
         data:
-          nullable: true
           description: Conteúdo da resposta; `null` em erro.
         message:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Texto que pode ser mostrado ao usuário.
         errors:
           type: array
@@ -1742,7 +1890,7 @@ components:
       type: object
       required: [campo, codigo, detalhe]
       properties:
-        campo: { type: string, nullable: true, example: "nome" }
+        campo: { type: [string, 'null'], example: "nome" }
         codigo: { type: string, example: "CAMPO_OBRIGATORIO" }
         detalhe: { type: string }
     PaginaResultado:
@@ -1785,14 +1933,14 @@ components:
       required: [nome, modoExibicao]
       properties:
         nome: { type: string, maxLength: 120, example: "Contato — Black Friday" }
-        descricao: { type: string, nullable: true, maxLength: 500 }
+        descricao: { type: [string, 'null'], maxLength: 500 }
         modoExibicao: { $ref: '#/components/schemas/ModoExibicao' }
         textoConsentimento:
           type: string
           description: Texto LGPD mostrado ao visitante; o texto vigente no aceite é o que fica registrado no envio.
           example: Autorizo o uso dos meus dados para contato comercial, conforme a Política de Privacidade.
-        mensagemSucesso: { type: string, nullable: true, example: "Recebemos seus dados. Em breve entraremos em contato." }
-        urlRedirecionamento: { type: string, format: uri, nullable: true }
+        mensagemSucesso: { type: [string, 'null'], example: "Recebemos seus dados. Em breve entraremos em contato." }
+        urlRedirecionamento: { type: [string, 'null'], format: uri }
     FormularioResumo:
       type: object
       properties:
@@ -1822,15 +1970,13 @@ components:
         rotulo: { type: string, maxLength: 200, example: "Seu melhor e-mail" }
         tipo: { $ref: '#/components/schemas/TipoCampo' }
         obrigatorio: { type: boolean }
-        placeholder: { type: string, nullable: true }
+        placeholder: { type: [string, 'null'] }
         opcoes:
-          type: array
-          nullable: true
+          type: [array, 'null']
           description: Só para LISTA_OPCOES e MULTIPLA_ESCOLHA.
           items: { type: string }
         mapeamentoCrm:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: |
             `crm_mapping` — campo do CRM que recebe o valor (ex. `contato.email`). Nulo = guardado
             só no envio. A lista de valores válidos depende do CRM e ainda não foi entregue.
@@ -1882,25 +2028,25 @@ components:
         pedirConsentimento:
           type: boolean
           description: Verdadeiro quando a próxima etapa é o aceite do consentimento.
-        textoConsentimento: { type: string, nullable: true }
+        textoConsentimento: { type: [string, 'null'] }
         proximaPergunta:
-          nullable: true
           description: Nula quando todas as perguntas foram respondidas.
-          allOf:
+          oneOf:
             - $ref: '#/components/schemas/CampoPublico'
+            - type: 'null'
         concluida: { type: boolean }
 
     # ── Origem (Pablo) ─────────────────────────────────────────────────
     ToqueOrigem:
       type: object
       properties:
-        utmSource: { type: string, nullable: true, example: "instagram" }
-        utmMedium: { type: string, nullable: true, example: "cpc" }
-        utmCampaign: { type: string, nullable: true, example: "black-friday-2026" }
-        utmTerm: { type: string, nullable: true }
-        utmContent: { type: string, nullable: true }
-        referenciador: { type: string, nullable: true, description: document.referrer, example: 'https://www.google.com/' }
-        paginaEntrada: { type: string, nullable: true, description: URL em que o visitante entrou. }
+        utmSource: { type: [string, 'null'], example: "instagram" }
+        utmMedium: { type: [string, 'null'], example: "cpc" }
+        utmCampaign: { type: [string, 'null'], example: "black-friday-2026" }
+        utmTerm: { type: [string, 'null'] }
+        utmContent: { type: [string, 'null'] }
+        referenciador: { type: [string, 'null'], description: document.referrer, example: 'https://www.google.com/' }
+        paginaEntrada: { type: [string, 'null'], description: URL em que o visitante entrou. }
         ocorridoEm: { type: string, format: date-time }
     Origem:
       type: object
@@ -1942,7 +2088,7 @@ components:
           properties:
             titulo: { type: string, maxLength: 70 }
             descricao: { type: string, maxLength: 160 }
-            imagemCompartilhamento: { type: string, format: uri, nullable: true }
+            imagemCompartilhamento: { type: [string, 'null'], format: uri }
             indexar: { type: boolean, default: true }
         rastreamento:
           type: object
@@ -1963,14 +2109,14 @@ components:
         status: { $ref: '#/components/schemas/StatusPagina' }
         totalVisitas: { type: integer, readOnly: true }
         totalEnvios: { type: integer, readOnly: true }
-        publicadaEm: { type: string, format: date-time, nullable: true }
+        publicadaEm: { type: [string, 'null'], format: date-time }
     LandingPage:
       allOf:
         - type: object
           properties:
             id: { type: string, format: uuid, readOnly: true }
             status: { $ref: '#/components/schemas/StatusPagina' }
-            publicadaEm: { type: string, format: date-time, nullable: true, readOnly: true }
+            publicadaEm: { type: [string, 'null'], format: date-time, readOnly: true }
             temAlteracaoNaoPublicada:
               type: boolean
               readOnly: true
@@ -1995,9 +2141,8 @@ components:
           additionalProperties: true
           example: { titulo: Até 40% de desconto, subtitulo: Só até domingo }
         formularioId:
-          type: string
+          type: [string, 'null']
           format: uuid
-          nullable: true
           description: Obrigatório quando `tipo` = FORMULARIO.
     Bloco:
       allOf:
@@ -2015,7 +2160,7 @@ components:
           properties:
             titulo: { type: string }
             descricao: { type: string }
-            imagemCompartilhamento: { type: string, nullable: true }
+            imagemCompartilhamento: { type: [string, 'null'] }
             indexar: { type: boolean }
         html:
           type: string
@@ -2035,12 +2180,11 @@ components:
         rotulo: { type: string }
         tipo: { $ref: '#/components/schemas/TipoCampo' }
         obrigatorio: { type: boolean }
-        placeholder: { type: string, nullable: true }
-        opcoes: { type: array, nullable: true, items: { type: string } }
+        placeholder: { type: [string, 'null'] }
+        opcoes: { type: [array, 'null'], items: { type: string } }
         ordem: { type: integer }
         textoPergunta:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Só no modo CHATBOT.
     FormularioPublico:
       type: object
@@ -2069,12 +2213,63 @@ components:
           properties:
             aceito: { type: boolean, enum: [true] }
         paginaSlug:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Slug da landing page, quando o formulário está dentro de uma.
         origem: { $ref: '#/components/schemas/Origem' }
     ConfirmacaoEnvio:
       type: object
       properties:
         mensagemSucesso: { type: string }
-        urlRedirecionamento: { type: string, format: uri, nullable: true }
+        urlRedirecionamento: { type: [string, 'null'], format: uri }
+
+    # ── Envios (Rafael) ────────────────────────────────────────────────
+    CanalEnvio:
+      type: string
+      enum: [formulario, landing_page, embed, chatbot]
+      description: Como o formulário foi acessado. Mesmos valores do evento `landing.formulario.recebido`.
+    EnvioResumo:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        formularioId: { type: string, format: uuid }
+        formularioNome: { type: string, example: "Contato — Black Friday" }
+        paginaId: { type: [string, 'null'], format: uuid }
+        canal: { $ref: '#/components/schemas/CanalEnvio' }
+        nome: { type: [string, 'null'], description: Valor do campo mapeado para o nome do contato., example: "Ana Souza" }
+        email: { type: [string, 'null'], format: email, example: "ana@empresa.com.br" }
+        recebidoEm: { type: string, format: date-time }
+        anonimizado: { type: boolean }
+    Envio:
+      allOf:
+        - $ref: '#/components/schemas/EnvioResumo'
+        - type: object
+          properties:
+            respostas:
+              type: array
+              description: Na ordem dos campos do formulário. Campo excluído depois do envio continua aqui, com o rótulo da época.
+              items: { $ref: '#/components/schemas/RespostaEnvio' }
+            origem: { $ref: '#/components/schemas/Origem' }
+            consentimento: { $ref: '#/components/schemas/ConsentimentoRegistrado' }
+            empresaId:
+              type: [string, 'null']
+              format: uuid
+              description: Empresa criada ou reaproveitada no CRM; `null` se o CRM não respondeu.
+            contatoId:
+              type: [string, 'null']
+              format: uuid
+              description: Contato criado no CRM; `null` se o CRM não respondeu.
+    RespostaEnvio:
+      type: object
+      properties:
+        campoId: { type: string, format: uuid }
+        rotulo: { type: string, example: "Seu melhor e-mail" }
+        tipo: { $ref: '#/components/schemas/TipoCampo' }
+        valor:
+          description: Texto, número, booleano ou lista, conforme o tipo do campo; `null` quando o envio foi anonimizado.
+          example: "ana@empresa.com.br"
+    ConsentimentoRegistrado:
+      type: object
+      properties:
+        aceito: { type: boolean, enum: [true] }
+        texto: { type: string, description: Texto LGPD exibido ao visitante no momento do aceite. }
+        aceitoEm: { type: string, format: date-time }
